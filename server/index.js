@@ -339,6 +339,16 @@ async function handle(req, res) {
     if (req.method === 'GET' && pathname === '/api/auth/me') {
       const user = requireUser(req); sendJson(res, 200, { user: safeUser(user) }); return;
     }
+    if (req.method === 'PATCH' && pathname === '/api/profile') {
+      const user = requireUser(req, ['student', 'provider']);
+      const body = await readJson(req);
+      const name = textField(body, 'name', 'الاسم الظاهر', 2, 40);
+      const about = textField(body, 'about', 'النبذة', 0, 360, true);
+      const skills = Array.isArray(body.skills) ? body.skills.slice(0, 12).map((skill) => String(skill).trim()).filter(Boolean) : [];
+      if (skills.some((skill) => skill.length > 40)) fail(400, 'يجب ألا تتجاوز المهارة 40 حرفًا.');
+      db.prepare('UPDATE users SET name = ?, about = ?, skills_json = ? WHERE id = ?').run(name, about || 'أعرّف طلاب الجامعة بمهاراتي وخدماتي.', JSON.stringify(skills), user.id);
+      sendJson(res, 200, { profile: safeUser(userById(user.id)) }); return;
+    }
     if (req.method === 'POST' && pathname === '/api/offers') {
       const user = requireUser(req, ['provider']); const body = await readJson(req);
       const offer = validateOffer(body);
@@ -356,6 +366,55 @@ async function handle(req, res) {
       db.prepare('UPDATE offers SET title = ?, category = ?, description = ?, duration = ?, mode = ?, availability = ?, updated_at = ? WHERE id = ?')
         .run(offer.title, offer.category, offer.description, offer.duration, offer.mode, offer.availability, now(), existing.id);
       sendJson(res, 200, { offer: offerView(db.prepare(`${joinedOffers} WHERE o.id = ?`).get(existing.id)) }); return;
+    }
+    if (req.method === 'POST' && pathname === '/api/requests') {
+      const user = requireUser(req, ['student']); const body = await readJson(req);
+      const offer = db.prepare(`${joinedOffers} WHERE o.id = ? AND o.active = 1`).get(String(body.offerId || ''));
+      if (!offer) fail(404, 'هذه الخدمة غير متاحة الآن.');
+      if (offer.provider_id === user.id) fail(400, 'لا يمكنك طلب خدمة منشورة من حسابك.');
+      const note = textField(body, 'note', 'تفاصيل الطلب', 8, 1600);
+      const desiredDate = body.desiredDate ? String(body.desiredDate) : null;
+      const parsedDesiredDate = desiredDate && /^\d{4}-\d{2}-\d{2}$/.test(desiredDate) ? new Date(`${desiredDate}T00:00:00Z`) : null;
+      if (desiredDate && (!parsedDesiredDate || Number.isNaN(parsedDesiredDate.getTime()) || parsedDesiredDate.toISOString().slice(0, 10) !== desiredDate || desiredDate < new Date().toISOString().slice(0, 10))) fail(400, 'اختر موعدًا صالحًا اليوم أو بعده.');
+      const id = randomUUID(); const created = now();
+      let publicId;
+      do { publicId = `WR-${String(randomInt(10000, 99999))}`; } while (db.prepare('SELECT id FROM requests WHERE public_id = ?').get(publicId));
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.prepare('INSERT INTO requests (id, public_id, offer_id, student_id, provider_id, title, category, note, desired_date, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(id, publicId, offer.id, user.id, offer.provider_id, offer.title, offer.category, note, desiredDate, 'pending', created, created);
+        db.prepare('INSERT INTO request_events (id, request_id, actor_id, from_status, to_status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(randomUUID(), id, user.id, null, 'pending', created);
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+      sendJson(res, 201, { request: requestView(db.prepare(`${joinedRequests} WHERE r.id = ?`).get(id)) }); return;
+    }
+    const requestMatch = pathname.match(/^\/api\/requests\/([\w-]+)\/status$/);
+    if (req.method === 'PATCH' && requestMatch) {
+      const user = requireUser(req, ['provider']); const body = await readJson(req);
+      const request = db.prepare('SELECT * FROM requests WHERE public_id = ?').get(requestMatch[1]);
+      if (!request) fail(404, 'لم نعثر على الطلب المطلوب.');
+      if (request.provider_id !== user.id) fail(403, 'هذا الطلب غير تابع لحسابك.');
+      const status = body.status;
+      const nextStatuses = { pending: ['accepted', 'rejected'], accepted: ['progress'], progress: ['completed'] };
+      if (!nextStatuses[request.status]?.includes(status)) fail(409, 'لا يمكن تغيير الطلب إلى هذه الحالة الآن.');
+      const created = now();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.prepare('UPDATE requests SET status = ?, updated_at = ? WHERE id = ?').run(status, created, request.id);
+        db.prepare('INSERT INTO request_events (id, request_id, actor_id, from_status, to_status, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(randomUUID(), request.id, user.id, request.status, status, created);
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+      sendJson(res, 200, { request: requestView(db.prepare(`${joinedRequests} WHERE r.id = ?`).get(request.id)) }); return;
+    }
+    if (req.method === 'GET' && pathname === '/api/admin/summary') {
+      requireUser(req, ['admin']);
+      sendJson(res, 200, {
+        users: db.prepare('SELECT role, COUNT(*) AS total FROM users GROUP BY role').all(),
+        offers: db.prepare('SELECT COUNT(*) AS total, SUM(active) AS active FROM offers').get(),
+        requests: db.prepare('SELECT status, COUNT(*) AS total FROM requests GROUP BY status').all(),
+      }); return;
     }
     fail(404, 'المسار غير موجود.');
   }
@@ -375,6 +434,10 @@ function validateOffer(body) {
   if (!allowedModes.has(mode)) fail(400, 'اختر طريقة تقديم صحيحة.');
   if (!allowedAvailability.has(availability)) fail(400, 'اختر حالة التوفر.');
   return { title, category, description, duration, mode, availability };
+}
+
+function randomInt(min, max) {
+  return min + randomBytes(4).readUInt32BE(0) % (max - min);
 }
 
 await seedDatabase();
