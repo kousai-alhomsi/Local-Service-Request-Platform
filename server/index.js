@@ -339,11 +339,42 @@ async function handle(req, res) {
     if (req.method === 'GET' && pathname === '/api/auth/me') {
       const user = requireUser(req); sendJson(res, 200, { user: safeUser(user) }); return;
     }
+    if (req.method === 'POST' && pathname === '/api/offers') {
+      const user = requireUser(req, ['provider']); const body = await readJson(req);
+      const offer = validateOffer(body);
+      const id = randomUUID(); const created = now();
+      db.prepare('INSERT INTO offers (id, provider_id, title, category, description, duration, mode, availability, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(id, user.id, offer.title, offer.category, offer.description, offer.duration, offer.mode, offer.availability, created, created);
+      sendJson(res, 201, { offer: offerView(db.prepare(`${joinedOffers} WHERE o.id = ?`).get(id)) }); return;
+    }
+    const offerMatch = pathname.match(/^\/api\/offers\/([\w-]+)$/);
+    if (req.method === 'PATCH' && offerMatch) {
+      const user = requireUser(req, ['provider']); const existing = db.prepare('SELECT * FROM offers WHERE id = ?').get(offerMatch[1]);
+      if (!existing) fail(404, 'لم نعثر على الخدمة المطلوبة.');
+      if (existing.provider_id !== user.id) fail(403, 'لا يمكنك تعديل خدمة حساب آخر.');
+      const offer = validateOffer(await readJson(req));
+      db.prepare('UPDATE offers SET title = ?, category = ?, description = ?, duration = ?, mode = ?, availability = ?, updated_at = ? WHERE id = ?')
+        .run(offer.title, offer.category, offer.description, offer.duration, offer.mode, offer.availability, now(), existing.id);
+      sendJson(res, 200, { offer: offerView(db.prepare(`${joinedOffers} WHERE o.id = ?`).get(existing.id)) }); return;
+    }
     fail(404, 'المسار غير موجود.');
   }
 
   if (serveFrontend(req, res, pathname)) return;
   sendJson(res, 404, { error: 'المسار غير موجود.' });
+}
+
+function validateOffer(body) {
+  const title = textField(body, 'title', 'اسم الخدمة', 5, 80);
+  const category = typeof body.category === 'string' ? body.category : '';
+  const description = textField(body, 'description', 'وصف الخدمة', 15, 420);
+  const duration = textField(body, 'duration', 'المدة المتوقعة', 3, 50);
+  const mode = typeof body.mode === 'string' ? body.mode : '';
+  const availability = typeof body.availability === 'string' ? body.availability : '';
+  if (!allowedCategories.has(category)) fail(400, 'اختر تصنيفًا صحيحًا للخدمة.');
+  if (!allowedModes.has(mode)) fail(400, 'اختر طريقة تقديم صحيحة.');
+  if (!allowedAvailability.has(availability)) fail(400, 'اختر حالة التوفر.');
+  return { title, category, description, duration, mode, availability };
 }
 
 await seedDatabase();
