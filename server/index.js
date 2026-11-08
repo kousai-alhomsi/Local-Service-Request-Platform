@@ -339,6 +339,16 @@ async function handle(req, res) {
     if (req.method === 'GET' && pathname === '/api/auth/me') {
       const user = requireUser(req); sendJson(res, 200, { user: safeUser(user) }); return;
     }
+    if (req.method === 'PATCH' && pathname === '/api/profile') {
+      const user = requireUser(req, ['student', 'provider']);
+      const body = await readJson(req);
+      const name = textField(body, 'name', 'الاسم الظاهر', 2, 40);
+      const about = textField(body, 'about', 'النبذة', 0, 360, true);
+      const skills = Array.isArray(body.skills) ? body.skills.slice(0, 12).map((skill) => String(skill).trim()).filter(Boolean) : [];
+      if (skills.some((skill) => skill.length > 40)) fail(400, 'يجب ألا تتجاوز المهارة 40 حرفًا.');
+      db.prepare('UPDATE users SET name = ?, about = ?, skills_json = ? WHERE id = ?').run(name, about || 'أعرّف طلاب الجامعة بمهاراتي وخدماتي.', JSON.stringify(skills), user.id);
+      sendJson(res, 200, { profile: safeUser(userById(user.id)) }); return;
+    }
     if (req.method === 'POST' && pathname === '/api/offers') {
       const user = requireUser(req, ['provider']); const body = await readJson(req);
       const offer = validateOffer(body);
